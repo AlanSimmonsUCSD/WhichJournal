@@ -25,7 +25,7 @@ import requests
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-VERSION = "1.5"  # app.py checks this, to catch a stale core.py after a partial upload
+VERSION = "1.6"  # app.py checks this, to catch a stale core.py after a partial upload
 
 EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 OPENALEX = "https://api.openalex.org"
@@ -421,6 +421,28 @@ _SOURCE_CACHE: dict[str, tuple[float, dict | None]] = {}  # issn -> (fetched_at,
 _CACHE_TTL = 7 * 24 * 3600
 
 
+def _merge_records(cands: list[dict]) -> dict:
+    """Several OpenAlex records can describe one journal (print/online ISSN, duplicates). Keep the
+    largest as the main record, but fill any of its empty fields (e.g. APC) from the others."""
+    cands = sorted(cands, key=lambda c: c.get("Total works") or 0, reverse=True)
+    merged = dict(cands[0])
+    for other in cands[1:]:
+        for k, v in other.items():
+            if (merged.get(k) is None or (isinstance(merged.get(k), float) and np.isnan(merged[k]))) \
+                    and v is not None:
+                merged[k] = v
+    return merged
+
+
+def _apc_usd(s: dict):
+    if s.get("apc_usd") is not None:
+        return s["apc_usd"]
+    for p in s.get("apc_prices") or []:  # fall back to a listed price in USD
+        if (p.get("currency") or "").upper() == "USD" and p.get("price") is not None:
+            return p["price"]
+    return None
+
+
 def openalex_sources(client: Client, issns: list[str]) -> dict[str, dict]:
     """Return {issn: source-summary} for every ISSN OpenAlex knows. Results are cached for a week
     in this process, so repeat searches cost (almost) no OpenAlex budget."""
@@ -453,16 +475,14 @@ def openalex_sources(client: Client, issns: list[str]) -> dict[str, dict]:
                 "Total works": s.get("works_count"),
                 "Open access journal": bool(s.get("is_oa")),
                 "In DOAJ": bool(s.get("is_in_doaj")),
-                "APC (USD)": s.get("apc_usd"),
+                "APC (USD)": _apc_usd(s),
                 "Publisher": s.get("host_organization_name"),
                 "Homepage": s.get("homepage_url"),
                 "Main subfield": sub_counts.most_common(1)[0][0] if sub_counts else None,
             }
             for issn in (s.get("issn") or []) + ([s.get("issn_l")] if s.get("issn_l") else []):
                 prev = found.get(issn.upper())
-                # Several OpenAlex records can share an ISSN; keep the biggest (the real journal).
-                if prev is None or (info["Total works"] or 0) > (prev["Total works"] or 0):
-                    found[issn.upper()] = info
+                found[issn.upper()] = info if prev is None else _merge_records([prev, info])
         for issn in issns[i : i + 50]:
             _SOURCE_CACHE[issn] = (now, found.get(issn))
     return found
@@ -477,8 +497,7 @@ def attach_openalex(journals: pd.DataFrame, sources: dict[str, dict]) -> pd.Data
     rows = []
     for _, r in journals.iterrows():
         cands = [sources[i.upper()] for i in [r["issn_l"], *r["issns"]] if i and i.upper() in sources]
-        # print & electronic ISSNs can map to different OpenAlex records; keep the largest
-        rows.append(max(cands, key=lambda c: c["Total works"] or 0) if cands else {})
+        rows.append(_merge_records(cands) if cands else {})
     meta = pd.DataFrame(rows, index=journals.index).reindex(columns=META_COLS)
     return pd.concat([journals, meta], axis=1)
 

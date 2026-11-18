@@ -17,7 +17,7 @@ import textextract
 
 st.set_page_config(page_title="Journal Finder", page_icon="📚", layout="wide")
 
-CORE_VERSION = "1.5"
+CORE_VERSION = "1.6"
 if getattr(core, "VERSION", None) != CORE_VERSION:
     st.error(f"`core.py` is out of date (found version {getattr(core, 'VERSION', 'unknown')}, "
              f"expected {CORE_VERSION}). Upload **all** project files to GitHub — app.py, core.py, "
