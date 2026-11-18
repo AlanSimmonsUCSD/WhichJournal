@@ -45,9 +45,14 @@ DOMAINS: dict[str, str] = {
 }
 
 # Used for the "also include methods/biostatistics journals" switch
+# [majr] = major topic of the paper. Plain [mh] is far too broad here: ordinary trials get tagged
+# "Research Design" sub-terms like "Double-Blind Method", which made 20-40% of clinical journals
+# look like methods journals.
 METHODS_MESH = (
-    '"Statistics as Topic"[mh] OR "Models, Statistical"[mh] OR "Research Design"[mh] OR '
-    '"Randomized Controlled Trials as Topic"[mh] OR "Data Interpretation, Statistical"[mh]'
+    '"Models, Statistical"[majr] OR "Data Interpretation, Statistical"[majr] OR '
+    '"Statistics as Topic"[majr] OR "Research Design"[majr] OR '
+    '"Randomized Controlled Trials as Topic"[majr] OR "Bayes Theorem"[majr] OR '
+    '"Computer Simulation"[majr] OR "Sample Size"[majr]'
 )
 
 _NOT_SECONDARY = (
@@ -86,12 +91,17 @@ STOPWORDS = set(ENGLISH_STOP_WORDS) | _EXTRA_STOP
 # --------------------------------------------------------------------------------------
 # HTTP helpers
 # --------------------------------------------------------------------------------------
+class OpenAlexLimit(RuntimeError):
+    """OpenAlex refused because the (shared or personal) daily budget is spent."""
+
+
 class Client:
     """Small polite HTTP client for NCBI E-utilities and OpenAlex."""
 
-    def __init__(self, email: str = "", ncbi_api_key: str = ""):
+    def __init__(self, email: str = "", ncbi_api_key: str = "", openalex_api_key: str = ""):
         self.email = email
         self.key = ncbi_api_key
+        self.openalex_key = openalex_api_key
         self.s = requests.Session()
         self.s.headers["User-Agent"] = f"journal-finder/1.0 ({email or 'no-email'})"
         self._last = 0.0
@@ -125,8 +135,14 @@ class Client:
         p = dict(params)
         if self.email:
             p["mailto"] = self.email
+        headers = {"Authorization": f"Bearer {self.openalex_key}"} if self.openalex_key else {}
         for attempt in range(5):
-            r = self.s.get(f"{OPENALEX}/{path}", params=p, timeout=60)
+            r = self.s.get(f"{OPENALEX}/{path}", params=p, headers=headers, timeout=60)
+            if r.status_code == 429 and float(r.headers.get("retry-after", 0) or 0) > 30:
+                raise OpenAlexLimit(
+                    "OpenAlex's daily allowance is used up"
+                    + (" for your API key." if self.openalex_key else
+                       " (no API key, so the allowance is shared by everyone on this server's IP)."))
             if r.status_code in (429, 500, 502, 503):
                 time.sleep(1.5 * (attempt + 1))
                 continue
@@ -197,6 +213,18 @@ def _text(el) -> str:
     return "" if el is None else "".join(el.itertext()).strip()
 
 
+def _authors(mc) -> list[dict]:
+    out = []
+    for a in mc.findall("Article/AuthorList/Author"):
+        last = a.findtext("LastName")
+        if not last:  # collective/group author
+            continue
+        out.append({"last": last.strip(), "fore": (a.findtext("ForeName") or "").strip(),
+                    "initials": (a.findtext("Initials") or "").strip(),
+                    "affiliation": (a.findtext("AffiliationInfo/Affiliation") or "").strip()})
+    return out
+
+
 def parse_pubmed_xml(xml_text: str) -> list[dict]:
     root = ET.fromstring(xml_text)
     out = []
@@ -221,6 +249,7 @@ def parse_pubmed_xml(xml_text: str) -> list[dict]:
                 "issns": issns,
                 "year": year,
                 "pub_types": [e.text for e in mc.findall("Article/PublicationTypeList/PublicationType")],
+                "authors": _authors(mc),
             }
         )
     return out
@@ -229,10 +258,18 @@ def parse_pubmed_xml(xml_text: str) -> list[dict]:
 def efetch(client: Client, pmids: list[str], batch: int = 200) -> list[dict]:
     recs: list[dict] = []
     for i in range(0, len(pmids), batch):
-        r = client.ncbi(
-            "efetch", {"db": "pubmed", "id": ",".join(pmids[i : i + batch]), "retmode": "xml"}, post=True
-        )
-        recs.extend(parse_pubmed_xml(r.text))
+        for attempt in range(3):  # NCBI occasionally returns truncated XML; just retry
+            r = client.ncbi(
+                "efetch", {"db": "pubmed", "id": ",".join(pmids[i : i + batch]), "retmode": "xml"},
+                post=True,
+            )
+            try:
+                recs.extend(parse_pubmed_xml(r.text))
+                break
+            except ET.ParseError:
+                if attempt == 2:
+                    raise
+                time.sleep(1 + attempt)
     return recs
 
 
@@ -264,14 +301,55 @@ def journal_key(rec: dict) -> str:
     return rec["issn_l"] or (rec["issns"][0] if rec["issns"] else rec["journal"].lower())
 
 
-def score_articles(query_text: str, recs: list[dict]) -> pd.DataFrame:
-    """Cosine similarity (TF-IDF, uni+bigrams) between the query and each candidate."""
-    docs = [f"{r['title']}. {r['abstract']}" for r in recs]
+EMBED_MODEL = "BAAI/bge-small-en-v1.5"  # ~130 MB ONNX model, runs on CPU, no PyTorch needed
+_EMBEDDER = None
+
+
+def get_embedder():
+    """Lazily load the sentence-embedding model (downloaded from Hugging Face on first use)."""
+    global _EMBEDDER
+    if _EMBEDDER is None:
+        from fastembed import TextEmbedding  # optional dependency
+        _EMBEDDER = TextEmbedding(EMBED_MODEL)
+    return _EMBEDDER
+
+
+def tfidf_similarity(query_text: str, docs: list[str]) -> np.ndarray:
     vec = TfidfVectorizer(stop_words=list(STOPWORDS), ngram_range=(1, 2), sublinear_tf=True, min_df=1)
     X = vec.fit_transform(docs + [query_text])
-    sims = cosine_similarity(X[-1], X[:-1]).ravel()
+    return cosine_similarity(X[-1], X[:-1]).ravel()
+
+
+def embedding_similarity(query_text: str, docs: list[str]) -> np.ndarray:
+    V = np.array(list(get_embedder().embed([query_text] + docs, batch_size=32)), dtype=np.float32)
+    V /= np.linalg.norm(V, axis=1, keepdims=True) + 1e-9
+    return V[1:] @ V[0]
+
+
+def _minmax(x: np.ndarray) -> np.ndarray:
+    return (x - x.min()) / (x.max() - x.min()) if x.max() > x.min() else np.ones_like(x)
+
+
+def score_articles(query_text: str, recs: list[dict], method: str = "tfidf") -> pd.DataFrame:
+    """Similarity between the query and each candidate.
+    method: "tfidf" (keyword overlap), "semantic" (sentence embeddings) or "hybrid" (average of
+    both after min-max scaling). Falls back to TF-IDF if the embedding model can't be loaded."""
+    docs = [f"{r['title']}. {r['abstract']}" for r in recs]
+    used = "tfidf"
+    sims = tfidf_similarity(query_text, docs)
+    if method in ("semantic", "hybrid"):
+        try:
+            emb = embedding_similarity(query_text, docs)
+            if method == "semantic":
+                sims = np.clip(emb, 0, None)
+            else:
+                sims = 0.5 * _minmax(sims) + 0.5 * _minmax(emb)
+            used = method
+        except Exception:  # model missing / download blocked -> keyword matching
+            pass
     df = pd.DataFrame(recs)
     df["similarity"] = sims
+    df.attrs["method_used"] = used
     df["jkey"] = [journal_key(r) for r in recs]
     return df.sort_values("similarity", ascending=False).reset_index(drop=True)
 
@@ -296,12 +374,58 @@ def score_journals(articles: pd.DataFrame, top_k: int = 50) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------------------
+# Reviewer suggestions (JANE-style "find authors")
+# --------------------------------------------------------------------------------------
+def suggest_reviewers(articles: pd.DataFrame, top_k: int = 50, n: int = 30) -> pd.DataFrame:
+    """Authors of the most similar articles, scored by the summed similarity of their papers.
+    First/last authors get full weight, middle authors half (they're often less senior/central)."""
+    if articles.empty or "authors" not in articles:
+        return pd.DataFrame()
+    people: dict[str, dict] = {}
+    for _, a in articles.head(top_k).iterrows():
+        auths = a["authors"] or []
+        for pos, au in enumerate(auths):
+            key = f"{au['last']} {au['initials'] or au['fore'][:1]}".lower()
+            w = 1.0 if pos in (0, len(auths) - 1) else 0.5
+            p = people.setdefault(key, {"Name": f"{au['fore']} {au['last']}".strip(), "last": au["last"],
+                                        "initials": au["initials"], "score": 0.0, "papers": [],
+                                        "first/last": 0, "affiliation": "", "aff_year": ""})
+            p["score"] += w * a["similarity"]
+            p["papers"].append(a["pmid"])
+            p["first/last"] += pos in (0, len(auths) - 1)
+            if au["affiliation"] and str(a["year"]) >= str(p["aff_year"]):
+                p["affiliation"], p["aff_year"] = au["affiliation"], a["year"]
+    if not people:
+        return pd.DataFrame()
+    df = pd.DataFrame(people.values())
+    df["Similar papers"] = df["papers"].str.len()
+    df["Score"] = 100 * df["score"] / df["score"].max()
+    df["PubMed"] = ("https://pubmed.ncbi.nlm.nih.gov/?term=" + df["last"].str.replace(" ", "+")
+                    + "+" + df["initials"] + "%5Bau%5D")
+    df["Their similar papers"] = df["papers"].apply(
+        lambda ps: "https://pubmed.ncbi.nlm.nih.gov/?term=" + "+OR+".join(f"{p}%5Bpmid%5D" for p in ps))
+    df = df.rename(columns={"affiliation": "Latest affiliation"})
+    return (df.sort_values(["Score", "Similar papers"], ascending=False).head(n)
+              [["Name", "Score", "Similar papers", "first/last", "Latest affiliation", "PubMed",
+                "Their similar papers"]].reset_index(drop=True))
+
+
+# --------------------------------------------------------------------------------------
 # OpenAlex journal metadata
 # --------------------------------------------------------------------------------------
+_SOURCE_CACHE: dict[str, tuple[float, dict | None]] = {}  # issn -> (fetched_at, info or None)
+_CACHE_TTL = 7 * 24 * 3600
+
+
 def openalex_sources(client: Client, issns: list[str]) -> dict[str, dict]:
-    """Return {issn: source-summary} for every ISSN OpenAlex knows."""
-    issns = sorted({i for i in issns if re.fullmatch(r"\d{4}-\d{3}[\dXx]", i or "")})
-    found: dict[str, dict] = {}
+    """Return {issn: source-summary} for every ISSN OpenAlex knows. Results are cached for a week
+    in this process, so repeat searches cost (almost) no OpenAlex budget."""
+    issns = sorted({i.upper() for i in issns if re.fullmatch(r"\d{4}-\d{3}[\dXx]", i or "")})
+    now = time.time()
+    fresh = {i: _SOURCE_CACHE[i][1] for i in issns
+             if i in _SOURCE_CACHE and now - _SOURCE_CACHE[i][0] < _CACHE_TTL}
+    found: dict[str, dict] = {i: v for i, v in fresh.items() if v}
+    issns = [i for i in issns if i not in fresh]
     this_year = time.gmtime().tm_year
     for i in range(0, len(issns), 50):
         data = client.openalex(
@@ -335,7 +459,14 @@ def openalex_sources(client: Client, issns: list[str]) -> dict[str, dict]:
                 # Several OpenAlex records can share an ISSN; keep the biggest (the real journal).
                 if prev is None or (info["Total works"] or 0) > (prev["Total works"] or 0):
                     found[issn.upper()] = info
+        for issn in issns[i : i + 50]:
+            _SOURCE_CACHE[issn] = (now, found.get(issn))
     return found
+
+
+META_COLS = ["OpenAlex name", "openalex_id", "2-yr mean citedness", "h-index", "Articles/yr",
+             "Total works", "Open access journal", "In DOAJ", "APC (USD)", "Publisher", "Homepage",
+             "Main subfield"]
 
 
 def attach_openalex(journals: pd.DataFrame, sources: dict[str, dict]) -> pd.DataFrame:
@@ -344,13 +475,110 @@ def attach_openalex(journals: pd.DataFrame, sources: dict[str, dict]) -> pd.Data
         cands = [sources[i.upper()] for i in [r["issn_l"], *r["issns"]] if i and i.upper() in sources]
         # print & electronic ISSNs can map to different OpenAlex records; keep the largest
         rows.append(max(cands, key=lambda c: c["Total works"] or 0) if cands else {})
-    meta = pd.DataFrame(rows, index=journals.index)
+    meta = pd.DataFrame(rows, index=journals.index).reindex(columns=META_COLS)
     return pd.concat([journals, meta], axis=1)
+
+
+# --------------------------------------------------------------------------------------
+# Appetite: what share of a journal's output is "your kind" of paper?
+# --------------------------------------------------------------------------------------
+_COUNT_CACHE: dict[str, int] = {}
+
+
+def pubmed_count(client: Client, query: str) -> int:
+    if query not in _COUNT_CACHE:
+        r = client.ncbi("esearch", {"db": "pubmed", "term": query, "retmax": 0, "retmode": "json"})
+        _COUNT_CACHE[query] = int(r.json()["esearchresult"].get("count", 0))
+    return _COUNT_CACHE[query]
+
+
+def appetite_clause(types: list[str], domains: list[str]) -> str:
+    """What counts as 'your kind of paper': the chosen article types, else the chosen domains."""
+    if types:
+        return "(" + " OR ".join(f"({ARTICLE_TYPES[t]})" for t in types) + ")"
+    if domains:
+        return "(" + " OR ".join(f"({DOMAINS[d]})" for d in domains) + ")"
+    return ""
+
+
+def add_appetite(client: Client, journals: pd.DataFrame, types: list[str], domains: list[str],
+                 year_from: int, year_to: int, max_journals: int = 25) -> pd.DataFrame:
+    """Appetite % = journal's PubMed papers matching your types (or domains) / all its PubMed
+    papers, over the same years. Computed for the top `max_journals` by fit (2 queries each)."""
+    j = journals.copy()
+    j["Your-type papers"] = np.nan
+    j["Total papers"] = np.nan
+    j["Appetite %"] = np.nan
+    clause = appetite_clause(types, domains)
+    if not clause:
+        return j
+    years = f"{year_from}:{year_to}[dp]"
+    for idx in j.index[:max_journals]:
+        issn = j.at[idx, "issn_l"] or (j.at[idx, "issns"][0] if j.at[idx, "issns"] else "")
+        if not issn:
+            continue
+        base = f"{issn}[is] AND {years}"
+        total = pubmed_count(client, base)
+        if total:
+            mine = pubmed_count(client, f"{base} AND {clause}")
+            j.loc[idx, ["Your-type papers", "Total papers", "Appetite %"]] = [mine, total, 100 * mine / total]
+    return j
+
+
+def balanced_score(j: pd.DataFrame, weight: float = 0.5) -> pd.Series:
+    """Weighted geometric mean of fit and appetite, both scaled 0-1, result 0-100.
+    weight = 0 -> pure fit, 0.5 -> equal balance, 1 -> pure appetite.
+    Appetite is put on a log scale first (shares span 0.1%-100%) and floored at 0.05 so a
+    journal is penalised, not zeroed, for a low share."""
+    fit = (j["Fit"] / 100).clip(lower=0.01)
+    app = j["Appetite %"]
+    if app.notna().sum() == 0:
+        return pd.Series(np.nan, index=j.index)
+    la = np.log10(app.clip(lower=0.01))
+    lo, hi = la.min(), la.max()
+    app_n = ((la - lo) / (hi - lo) if hi > lo else la * 0 + 1).clip(lower=0) * 0.95 + 0.05
+    score = 100 * fit ** (1 - weight) * app_n ** weight
+    return score / score.max() * 100
 
 
 # --------------------------------------------------------------------------------------
 # One-call convenience
 # --------------------------------------------------------------------------------------
+def random_article(
+    client: Client,
+    domains: list[str],
+    types: list[str],
+    year_from: int,
+    year_to: int,
+    rng=None,
+) -> dict | None:
+    """A random PubMed article (with abstract) matching the domain/type/year filters.
+    PubMed only lets us page through the first 10,000 hits, so we sample within those."""
+    import random
+
+    rng = rng or random.Random()
+    if not domains:  # no domain chosen -> pick one at random so demos vary
+        domains = [rng.choice(list(DOMAINS))]
+    parts = ["(" + " OR ".join(f"({DOMAINS[d]})" for d in domains) + ")"]
+    if types:
+        parts.append("(" + " OR ".join(f"({ARTICLE_TYPES[t]})" for t in types) + ")")
+    parts += [f"{year_from}:{year_to}[dp]", "hasabstract", "english[la]"]
+    q = " AND ".join(parts)
+    r = client.ncbi("esearch", {"db": "pubmed", "term": q, "retmax": 0, "retmode": "json"})
+    count = int(r.json()["esearchresult"].get("count", 0))
+    if not count:
+        return None
+    for _ in range(3):
+        start = rng.randrange(min(count, 9999))
+        r = client.ncbi("esearch", {"db": "pubmed", "term": q, "retmax": 1, "retstart": start,
+                                    "retmode": "json"})
+        ids = r.json()["esearchresult"].get("idlist", [])
+        recs = efetch(client, ids) if ids else []
+        if recs and len(recs[0]["abstract"]) > 400:
+            return {**recs[0], "demo_domains": domains}
+    return None
+
+
 def find_journals(
     client: Client,
     abstract: str,
@@ -365,6 +593,9 @@ def find_journals(
     n_candidates: int = 300,
     top_k: int = 50,
     refine: bool = True,
+    exclude_pmids: tuple[str, ...] = (),
+    appetite: bool = False,
+    method: str = "tfidf",
 ) -> dict:
     """If refine=True, a first pass with `terms_query` is used to learn which of the abstract's
     terms are distinctive, and the search is re-run with those (two-pass, JANE-like)."""
@@ -373,21 +604,32 @@ def find_journals(
     count, pmids = esearch(client, query, n_candidates)
     if not pmids:
         return {"query": query, "count": count, "articles": pd.DataFrame(),
-                "journals": pd.DataFrame(), "keywords": []}
-    recs = [r for r in efetch(client, pmids) if r["abstract"]]
+                "journals": pd.DataFrame(), "keywords": [], "warning": "",
+                "method_used": method, "reviewers": pd.DataFrame()}
+    excl = set(exclude_pmids)
+    recs = [r for r in efetch(client, [p for p in pmids if p not in excl]) if r["abstract"]]
     keywords: list[str] = []
     if refine and recs:
         keywords = refine_keywords(abstract, recs)
         q2 = build_query(keywords_to_query(keywords), *args)
         count2, pmids2 = esearch(client, q2, n_candidates)
         if pmids2:
-            seen = {r["pmid"] for r in recs}
+            seen = {r["pmid"] for r in recs} | excl
             new = [p for p in pmids2 if p not in seen]
             recs += [r for r in efetch(client, new) if r["abstract"]]
             query, count = q2, count2
-    articles = score_articles(abstract, recs)
+    articles = score_articles(abstract, recs, method)
     journals = score_journals(articles, top_k)
     issns = [i for lst in journals["issns"] for i in lst] + journals["issn_l"].tolist()
-    journals = attach_openalex(journals, openalex_sources(client, issns))
+    warning = ""
+    try:
+        sources = openalex_sources(client, issns)
+    except (OpenAlexLimit, requests.RequestException) as e:
+        sources, warning = {}, f"Impact / size / open-access data unavailable: {e}"
+    journals = attach_openalex(journals, sources)
+    if appetite:
+        journals = add_appetite(client, journals, types, domains, year_from, year_to)
     return {"query": query, "count": count, "articles": articles, "journals": journals,
-            "keywords": keywords}
+            "keywords": keywords, "warning": warning,
+            "method_used": articles.attrs.get("method_used", "tfidf"),
+            "reviewers": suggest_reviewers(articles, top_k)}

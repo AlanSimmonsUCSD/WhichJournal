@@ -7,12 +7,51 @@ papers match yours. Each journal is plotted with:
 
 | Axis | Meaning | Source |
 |---|---|---|
-| **y — Fit (0–100)** | Sum of TF-IDF cosine similarities of the journal's papers among the top-K most similar articles, scaled so the best journal = 100 | PubMed |
+| **y — Balanced score (0–100)** *(default)* | Fit and appetite combined (see below) | PubMed |
+| *or* **Fit (0–100)** | Sum of TF-IDF cosine similarities of the journal's papers among the top-K most similar articles, scaled so the best journal = 100 | PubMed |
+| *or* **Appetite (%)** | Share of all the journal's PubMed papers (same years) that are your article type, or your domain if no type is chosen | PubMed |
 | **x — Impact** | 2-year mean citedness (free analogue of the Journal Impact Factor) or h-index | OpenAlex |
 | **Bubble size** | Articles per year (3-yr mean) or # similar articles | OpenAlex / PubMed |
 | **Colour + shape** | Journal's main subfield: in your domain / methods & statistics / other | OpenAlex |
 
 ![screenshot](screenshot.png)
+
+## Features
+
+- **Paste, upload or demo.** Paste a title and abstract, or upload a manuscript (**PDF, DOCX or
+  DOC**). The title and abstract are pulled out and put in the text box for you to check. Files are
+  read in memory and never stored. **🎲 Demo** loads a random recent PubMed abstract.
+- **Fit × impact scatter plot.** Click a bubble (or use *Journal details*) for a card with the
+  journal homepage, its NLM Catalog entry, an author-guidelines search, its OpenAlex page, and the
+  similar papers it published.
+- **Matching**: keyword (TF-IDF), semantic (sentence embeddings) or hybrid. See below.
+- **Appetite and balanced score** (optional, off by default).
+- **🧑‍🔬 Suggested reviewers**: authors of the most similar papers, weighted by similarity. First and
+  last authors count fully, middle authors half. Includes their latest affiliation and PubMed links,
+  plus a box to exclude yourself and your co-authors. Always check for conflicts of interest.
+- **🔗 Shareable links**: a URL that restores all the filters, and optionally the abstract
+  (compressed), which re-runs the search when opened. Leave the abstract out for unpublished work.
+- Ranked table plus CSV downloads for journals and reviewers.
+
+## Semantic matching
+
+Keyword matching only sees shared words. "Dropout" and "attrition" don't match, for example.
+Semantic matching uses a small sentence-embedding model (`BAAI/bge-small-en-v1.5`) that compares
+meaning. **It works with the current GitHub + Streamlit Community Cloud setup:**
+
+- It runs through `fastembed` (ONNX Runtime), so there is **no PyTorch**. Installing it adds about
+  60 MB, compared with more than 700 MB for `sentence-transformers` + torch.
+- The model (about 130 MB) downloads from Hugging Face the first time someone uses semantic matching
+  (about 30 s) and is then cached until the app restarts. Memory use stays well within the free
+  tier's limits.
+- Embedding about 600 candidate abstracts on the free tier's CPU takes roughly 5–15 s.
+- If the model can't be loaded (no internet, `fastembed` not installed), the app falls back to
+  keyword matching and says so.
+- **Hybrid** averages the two scores after scaling each to 0–1. It's usually the most robust choice.
+
+Want a biomedical-specific model (for example a PubMedBERT variant)? Those need PyTorch, which is
+heavier but may still fit. Change `core.EMBED_MODEL` if fastembed supports the model; otherwise you'd
+switch to `sentence-transformers`.
 
 ## Run it locally
 
@@ -21,7 +60,7 @@ git clone https://github.com/<you>/journal-finder.git
 cd journal-finder
 python -m venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-cp .streamlit/secrets.toml.example .streamlit/secrets.toml   # add your e-mail (optional API key)
+cp .streamlit/secrets.toml.example .streamlit/secrets.toml   # add your e-mail + API keys
 streamlit run app.py
 ```
 
@@ -51,13 +90,42 @@ against predatory journals), maximum APC in USD, and a minimum number of similar
 
 **Plot**: impact metric, log x-axis, bubble size metric.
 
-**Presets**: for example, *Statistical RCT methods paper → psychiatry* sets Psychiatry + RCT +
-Statistical/methods, with methods journals switched on.
+**Paper-type presets**: Original research, Methods / statistics paper, Narrative review, and
+Systematic review / meta-analysis. Each one fills in the article types (and the methods-journals
+switch). Changing any of those by hand switches the preset back to *Custom*.
 
-Tip for a stats-methods paper aimed at psychiatry: compare the results with the
-methods-journals switch **on** and **off**. With it on, you see where methodologists publish. With
-it off, you see which psychiatry journals publish this kind of work (for example *J Affect Disord*,
-*J Clin Psychiatry*, *J Clin Psychopharmacol*).
+**🎲 Demo abstract** loads a random recent PubMed abstract that matches your selected domains and
+types (or a random domain if none are selected) and sets the filters to match. The demo paper is
+left out of the scoring, and the journal it was really published in is marked on the plot with a
+★ and its rank, which is a quick way to sanity-check the tool.
+
+Tip for a methods paper aimed at a clinical field: run it with the methods-journals switch **on**
+and **off**. With it on, you see where methodologists publish. With it off, you see which
+journals in the field publish this kind of work.
+
+## Fit vs appetite vs balanced score
+
+**Fit is a count, so it favours big journals.** A megajournal publishing 17,000 papers a year will
+almost always have a few papers like yours. **Appetite is a share**: of everything the journal
+publishes, how much is your kind of paper? A small stats journal with one similar paper but 75%
+methods content may suit a methods paper better than a big clinical journal with three similar
+papers that are rare exceptions.
+
+**Balanced score** = weighted geometric mean of the two:
+
+```
+balanced = fit_scaled^(1 - w) × appetite_scaled^w        (rescaled so the best journal = 100)
+```
+
+- `fit_scaled` = fit / 100.
+- `appetite_scaled` = appetite % on a log scale (shares range from about 0.1% to 100%), mapped to 0.05–1.
+  The 0.05 floor means a low share penalises a journal but never zeroes it.
+- `w` is the *Balance* slider: 0 = pure fit, 0.5 = equal weight (default), 1 = pure appetite.
+- A geometric mean means a journal must do reasonably on **both** to score well.
+
+Appetite costs two PubMed count queries per journal, so it is computed for the top 25 journals by
+fit. That takes about 10–25 s without an NCBI key and about 5 s with one. Neither measure knows
+editorial policy: many journals only publish reviews by invitation, so check the author guidelines.
 
 ## How it works
 
@@ -69,8 +137,13 @@ it off, you see which psychiatry journals publish this kind of work (for example
    decide each journal's fit.
 4. Journals are matched to OpenAlex by ISSN to get impact, volume, OA status and APC.
 
-Code layout: `core.py` holds all the logic (no UI, so it can be used from a notebook or script),
-and `app.py` holds the Streamlit UI.
+Code layout:
+- `core.py`: search, scoring, appetite and reviewers. It has no UI code, so you can use it from a notebook.
+- `textextract.py`: reads PDF / DOCX / DOC files.
+- `app.py`: the Streamlit UI.
+- `packages.txt`: system packages for Streamlit Cloud (`antiword`, for old .doc files).
+  To read .doc files locally, run `brew install antiword` or `apt install antiword`, or just save
+  the file as .docx.
 
 ## Put it on GitHub / online
 
@@ -81,14 +154,19 @@ gh repo create journal-finder --public --source=. --push     # or create the rep
 
 To get a free public web app, go to [share.streamlit.io](https://share.streamlit.io), choose
 **New app**, pick the repo and set `app.py` as the main file. Paste `CONTACT_EMAIL` /
-`NCBI_API_KEY` under *Settings → Secrets*. **Never commit `.streamlit/secrets.toml`**; it is
+`OPENALEX_API_KEY` / `NCBI_API_KEY` under *Settings → Secrets*. **Never commit `.streamlit/secrets.toml`**; it is
 already in `.gitignore`.
 
 ## Data & licensing notes
 
 - **PubMed / E-utilities**: free. Please supply an e-mail address. Limits are 3 requests/s without
   an API key and 10/s with one ([NCBI usage policy](https://www.ncbi.nlm.nih.gov/books/NBK25497/)).
-- **OpenAlex**: CC0, free to use and redistribute.
+- **OpenAlex**: CC0, free to use and redistribute. **Get a free API key**
+  ([help.openalex.org/api/authentication](https://help.openalex.org/api/authentication/)).
+  Without one, requests draw on a small daily allowance shared by everyone on the same IP address.
+  On Streamlit Cloud that means sharing it with other people's apps, so impact data can disappear.
+  The app still shows fit rankings when that happens, and it caches journal lookups for a week to
+  keep usage low.
 - The official **Journal Impact Factor** (Clarivate) is proprietary, so don't scrape it or commit it
   to a public repo. That is why this app uses OpenAlex's 2-yr mean citedness. It follows a similar
   idea but the numbers are not identical.
