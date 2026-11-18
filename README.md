@@ -31,7 +31,34 @@ papers match yours. Each journal is plotted with:
   plus a box to exclude yourself and your co-authors. Always check for conflicts of interest.
 - **🔗 Shareable links**: a URL that restores all the filters, and optionally the abstract
   (compressed), which re-runs the search when opened. Leave the abstract out for unpublished work.
+- **NIH public access status** for each journal, plus a filter (see below).
+- **Impact bands**: soft shading on the plot and a table column splitting the journals into thirds
+  (low / mid / high) by the x-axis impact metric. The cut points are the tertiles of *all journals in
+  the current result set*, worked out before journal filters run so a journal keeps its band when
+  you filter. They're relative guidance, not a global ranking.
 - Ranked table plus CSV downloads for journals and reviewers.
+
+## NIH Public Access Policy (2024, zero embargo)
+
+Since 1 July 2025, NIH-funded papers must be freely available in PubMed Central **on the date of
+publication**, with no embargo. The app checks each journal against the
+[PMC Journal List](https://pmc.ncbi.nlm.nih.gov/journals/), downloaded from
+`https://cdn.ncbi.nlm.nih.gov/pmc/home/jlist.csv` and cached for a day:
+
+| Status | Meaning |
+|---|---|
+| ✅ **Immediate – all articles** | Active agreement, 0-month release delay: every article goes to PMC on publication. Compliant with no action from you. |
+| ✅ **Immediate – NIH-funded** | Same, for NIH-funded articles. Compliant with no action from you. |
+| ⏳ **Delayed** | Deposits in PMC, but after an embargo. Not compliant by itself: deposit your accepted manuscript via NIHMS (if the publisher allows zero embargo) or pay for open access. |
+| ℹ️ **Not in PMC list** | No deposit agreement. Deposit your accepted manuscript via NIHMS yourself, after checking that the publisher allows zero-embargo deposit (fully open-access journals always do). |
+
+The **"NIH immediate release only"** filter keeps the two ✅ groups. Journals outside them can still
+be fine for NIH-funded work, but you have to check the publisher's policy. Several large publishers
+now require paid open access for zero-embargo compliance. Your library's public-access guide is the
+best source for publisher-level policies.
+
+If the list can't be downloaded, the status shows *Unknown* and the filter is skipped with a warning.
+As a backup you can save the CSV as `pmc_jlist.csv` next to `app.py`, but remember it goes stale.
 
 ## Semantic matching
 

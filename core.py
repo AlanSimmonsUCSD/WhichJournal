@@ -12,6 +12,8 @@ Pipeline
 """
 from __future__ import annotations
 
+import io
+import os
 import re
 import time
 import xml.etree.ElementTree as ET
@@ -542,6 +544,112 @@ def balanced_score(j: pd.DataFrame, weight: float = 0.5) -> pd.Series:
 
 
 # --------------------------------------------------------------------------------------
+# NIH Public Access Policy (2024, zero embargo): PMC Journal List
+# --------------------------------------------------------------------------------------
+PMC_JLIST_URL = "https://cdn.ncbi.nlm.nih.gov/pmc/home/jlist.csv"
+_PMC_CACHE: dict = {}
+
+NIH_STATUS_HELP = {
+    "Immediate – all articles": "Journal deposits the final version of every article in PMC on "
+                                "publication. NIH-compliant with no action from you.",
+    "Immediate – NIH-funded": "Journal deposits NIH-funded articles in PMC on publication. "
+                              "NIH-compliant with no action from you.",
+    "Delayed": "Journal deposits in PMC, but only after an embargo. Not compliant by itself: you "
+               "must deposit your accepted manuscript via NIHMS (if the publisher allows zero "
+               "embargo) or pay for open access.",
+    "Not in PMC list": "No PMC deposit agreement. You must deposit your accepted manuscript via "
+                       "NIHMS yourself; check the publisher allows zero-embargo deposit (fully "
+                       "open-access journals always do).",
+}
+
+
+def _col(df: pd.DataFrame, *names: str) -> str | None:
+    """Find a column by any of several names (the CSV headers changed in 2024)."""
+    low = {c.lower().strip(): c for c in df.columns}
+    for n in names:
+        for lc, c in low.items():
+            if lc.startswith(n.lower()):
+                return c
+    return None
+
+
+def _delay_months(v) -> float:
+    v = str(v or "").lower()
+    if "immediate" in v:
+        return 0.0
+    m = re.search(r"(\d+)", v)
+    return float(m.group(1)) if m else np.nan
+
+
+def parse_pmc_jlist(csv_text: str) -> dict[str, dict]:
+    """{ISSN: {'NIH / PMC': status, 'PMC delay': text, 'PMC URL': url}} from the PMC Journal List."""
+    df = pd.read_csv(io.StringIO(csv_text), dtype=str).fillna("")
+    c_p = _col(df, "ISSN (print)", "pISSN")
+    c_e = _col(df, "ISSN (online)", "eISSN")
+    c_delay = _col(df, "Release Delay", "Free access")
+    c_status = _col(df, "Agreement Status", "Deposit status")
+    c_agree = _col(df, "Agreement to Deposit", "Participation level")
+    c_url = _col(df, "PMC URL", "Journal URL")
+    if not (c_delay and (c_p or c_e)):
+        raise ValueError("PMC Journal List format not recognised")
+    out: dict[str, dict] = {}
+    for _, r in df.iterrows():
+        status = (r[c_status] if c_status else "").strip()
+        active = status == "" or status.lower() == "active"
+        if not active:
+            continue  # ceased / predecessor titles
+        months = _delay_months(r[c_delay])
+        agree = (r[c_agree] if c_agree else "").lower()
+        if months == 0:
+            label = "Immediate – NIH-funded" if "nih" in agree else "Immediate – all articles"
+        else:
+            label = "Delayed"
+        info = {"NIH / PMC": label, "PMC delay": r[c_delay].strip(),
+                "PMC URL": r[c_url].strip() if c_url else ""}
+        for c in (c_p, c_e):
+            issn = (r[c] if c else "").strip().upper()
+            if issn:
+                prev = out.get(issn)
+                if prev is None or prev["NIH / PMC"] == "Delayed":  # prefer an immediate record
+                    out[issn] = info
+    return out
+
+
+def pmc_journal_list(client: Client, ttl: float = 24 * 3600) -> dict[str, dict]:
+    """Download (and cache for a day) the PMC Journal List."""
+    if _PMC_CACHE.get("data") is not None and time.time() - _PMC_CACHE["t"] < ttl:
+        return _PMC_CACHE["data"]
+    local = os.environ.get("PMC_JLIST_FILE", "pmc_jlist.csv")  # optional manual copy / backup
+    if os.path.exists(local):
+        with open(local, encoding="utf-8-sig", errors="replace") as f:
+            text = f.read()
+    else:
+        r = client.s.get(PMC_JLIST_URL, timeout=60)
+        r.raise_for_status()
+        text = r.content.decode("utf-8-sig", errors="replace")
+    data = parse_pmc_jlist(text)
+    _PMC_CACHE.update(data=data, t=time.time())
+    return data
+
+
+def attach_pmc(journals: pd.DataFrame, pmc: dict[str, dict] | None) -> pd.DataFrame:
+    j = journals.copy()
+    rank = {"Immediate – all articles": 0, "Immediate – NIH-funded": 1, "Delayed": 2}
+    labels, delays, urls = [], [], []
+    for _, r in j.iterrows():
+        if pmc is None:
+            labels.append("Unknown"); delays.append(""); urls.append("")
+            continue
+        cands = [pmc[i.upper()] for i in [r["issn_l"], *r["issns"]] if i and i.upper() in pmc]
+        best = min(cands, key=lambda c: rank[c["NIH / PMC"]]) if cands else None
+        labels.append(best["NIH / PMC"] if best else "Not in PMC list")
+        delays.append(best["PMC delay"] if best else "")
+        urls.append(best["PMC URL"] if best else "")
+    j["NIH / PMC"], j["PMC delay"], j["PMC URL"] = labels, delays, urls
+    return j
+
+
+# --------------------------------------------------------------------------------------
 # One-call convenience
 # --------------------------------------------------------------------------------------
 def random_article(
@@ -627,6 +735,11 @@ def find_journals(
     except (OpenAlexLimit, requests.RequestException) as e:
         sources, warning = {}, f"Impact / size / open-access data unavailable: {e}"
     journals = attach_openalex(journals, sources)
+    try:
+        journals = attach_pmc(journals, pmc_journal_list(client))
+    except Exception as e:  # list unreachable or format changed
+        journals = attach_pmc(journals, None)
+        warning = (warning + " " if warning else "") + f"PMC Journal List unavailable ({e}); NIH status unknown."
     if appetite:
         journals = add_appetite(client, journals, types, domains, year_from, year_to)
     return {"query": query, "count": count, "articles": articles, "journals": journals,

@@ -78,7 +78,7 @@ ss = st.session_state
 DEFAULTS = dict(
     abstract="", preset="Custom", types=[], domains=[], methods=False,
     years=(THIS_YEAR - 5, THIS_YEAR), english=True, humans=False,
-    oa_only=False, doaj_only=False, max_apc=0, min_sim=1,
+    oa_only=False, doaj_only=False, nih_only=False, max_apc=0, min_sim=1, bands=True,
     appetite=False, weight=0.5, matching="Keyword (TF-IDF, fast)",
     y_metric="Fit", impact_metric="2-yr mean citedness", log_x=True, size_metric="Articles/yr",
     demo=None, exclude_pmid="",
@@ -101,7 +101,7 @@ def state_to_params(include_abstract: bool) -> dict:
         "types": "|".join(ss.types), "domains": "|".join(ss.domains),
         "years": f"{ss.years[0]}-{ss.years[1]}", "methods": int(ss.methods),
         "en": int(ss.english), "hum": int(ss.humans), "oa": int(ss.oa_only),
-        "doaj": int(ss.doaj_only), "apc": ss.max_apc, "min": ss.min_sim,
+        "doaj": int(ss.doaj_only), "nih": int(ss.nih_only), "bands": int(ss.bands), "apc": ss.max_apc, "min": ss.min_sim,
         "app": int(ss.appetite), "w": ss.weight, "match": MATCHING[ss.matching],
         "y": ss.y_metric, "x": ss.impact_metric, "logx": int(ss.log_x), "size": ss.size_metric,
     }
@@ -125,7 +125,8 @@ def apply_query_params():
             a, b = (int(x) for x in q["years"].split("-"))
             ss.years = (max(2000, a), min(THIS_YEAR, b))
         for key, name in [("methods", "methods"), ("en", "english"), ("hum", "humans"),
-                          ("oa", "oa_only"), ("doaj", "doaj_only"), ("app", "appetite"),
+                          ("oa", "oa_only"), ("doaj", "doaj_only"), ("nih", "nih_only"),
+                          ("bands", "bands"), ("app", "appetite"),
                           ("logx", "log_x")]:
             if key in q:
                 ss[name] = q[key] == "1"
@@ -243,6 +244,12 @@ with st.sidebar:
     st.toggle("Open-access journals only", key="oa_only")
     st.toggle("DOAJ-listed only", key="doaj_only",
               help="Directory of Open Access Journals — screens out most predatory journals.")
+    st.toggle("NIH immediate release (PMC, 0-month delay) only", key="nih_only",
+              help="Keeps journals on the PMC Journal List with an active agreement and a release "
+                   "delay of 0 months: they deposit articles in PubMed Central on publication, which "
+                   "meets the 2024 NIH Public Access Policy with no action from you. Other journals "
+                   "can still be compliant if you deposit your accepted manuscript via NIHMS and "
+                   "the publisher allows zero embargo — check before submitting.")
     st.number_input("Max APC in USD (0 = no limit)", 0, 15000, step=500, key="max_apc")
     st.slider("Min. similar articles per journal", 1, 10, key="min_sim")
 
@@ -268,6 +275,8 @@ with st.sidebar:
              help="2-yr mean citedness is OpenAlex's free analogue of the Journal Impact Factor "
                   "(similar idea, different numbers).")
     st.toggle("Log x-axis", key="log_x")
+    st.toggle("Shade impact bands (low / mid / high)", key="bands",
+              help="Thirds of the journals in this result set, by the impact metric on the x-axis.")
     st.radio("Bubble size", ["Articles/yr", "Similar articles"], key="size_metric")
 
     with st.expander("Advanced"):
@@ -390,6 +399,22 @@ if ss.demo:
     hit = j[j.apply(lambda r: bool(d_issns & ({r["issn_l"], *r["issns"]})), axis=1)]
     actual_key = hit["jkey"].iloc[0] if len(hit) else None
 
+# impact bands: thirds of ALL journals in this result set (before journal filters), so a
+# journal keeps its band when you filter
+x_col = ss.impact_metric
+BAND_TINTS = {"Low": "rgba(42,120,214,0.04)", "Mid": "rgba(42,120,214,0.09)",
+              "High": "rgba(42,120,214,0.16)"}
+BAND_CELLS = {"Low": "#f3f7fd", "Mid": "#e6effb", "High": "#d4e3f7"}
+imp = j[x_col]
+cuts = None
+if imp.notna().sum() >= 6:
+    t1, t2 = imp.quantile(1 / 3), imp.quantile(2 / 3)
+    cuts = (t1, t2)
+    j["Impact band"] = np.where(imp.isna(), "", np.where(imp >= t2, "High",
+                                                         np.where(imp >= t1, "Mid", "Low")))
+else:
+    j["Impact band"] = ""
+
 j = j[j["Similar articles"] >= ss.min_sim]
 if ss.oa_only:
     j = j[j["Open access journal"] == True]  # noqa: E712
@@ -397,6 +422,13 @@ if ss.doaj_only:
     j = j[j["In DOAJ"] == True]  # noqa: E712
 if ss.max_apc:
     j = j[j["APC (USD)"].isna() | (j["APC (USD)"] <= ss.max_apc)]
+if ss.nih_only:
+    if "NIH / PMC" in j and (j["NIH / PMC"] != "Unknown").any():
+        j = j[j["NIH / PMC"].str.startswith("Immediate")]
+    else:
+        st.warning("NIH status couldn't be checked (PMC Journal List unavailable), so the NIH filter "
+                   "was not applied.")
+
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("PubMed matches for query", f"{res['count']:,}")
@@ -407,7 +439,6 @@ c4.metric("Matching", {"tfidf": "Keyword", "semantic": "Semantic", "hybrid": "Hy
 y_col = Y_COLS[ss.y_metric] if has_app else "Fit"
 if not has_app and ss.y_metric != "Fit":
     st.caption("Turn on **Compute appetite** to plot balanced score or appetite — showing fit.")
-x_col = ss.impact_metric
 plot_df = j.dropna(subset=[x_col, y_col]).copy()
 if ss.log_x:
     plot_df = plot_df[plot_df[x_col] > 0]
@@ -428,7 +459,8 @@ else:
                         for a, n, k in zip(plot_df["Abbrev"], plot_df["Journal"], plot_df["jkey"])]
     hover = {"_size": False, "label": False, "Group": False, "Fit": ":.0f", x_col: ":.2f",
              "Similar articles": True, "Articles/yr": ":.0f", "Main subfield": True,
-             "Open access journal": True, "APC (USD)": True, "Publisher": True}
+             "Open access journal": True, "APC (USD)": True, "Publisher": True,
+             "NIH / PMC": True, "Impact band": True}
     if has_app:
         hover.update({"Balanced": ":.0f", "Appetite %": ":.1f"})
     fig = px.scatter(
@@ -439,13 +471,32 @@ else:
     )
     fig.update_traces(textposition="top center", textfont_size=11,
                       marker=dict(opacity=0.8, line=dict(width=2, color="white")))
+    if ss.bands and cuts:
+        lo, hi = plot_df[x_col].min(), plot_df[x_col].max()
+        if ss.log_x:
+            lo = max(lo, 1e-3)
+        conv = (lambda v: np.log10(v)) if ss.log_x else (lambda v: v)
+        pad = (conv(hi) - conv(lo)) * 0.04 or 0.1
+        left, right = conv(lo) - pad, conv(hi) + pad
+        bounds = [left, conv(cuts[0]), conv(cuts[1]), right]
+        for (name, tint), a, b in zip(BAND_TINTS.items(), bounds[:-1], bounds[1:]):
+            x0, x1 = max(a, left), min(b, right)
+            if x1 <= x0:
+                continue  # no journals in view fall in this band
+            fig.add_vrect(x0=10 ** x0 if ss.log_x else x0, x1=10 ** x1 if ss.log_x else x1,
+                          fillcolor=tint, opacity=1, line_width=0, layer="below")
+            fig.add_annotation(xref="x", yref="paper", x=(x0 + x1) / 2, y=1.0, yanchor="bottom",
+                               text=f"{name} impact", showarrow=False,
+                               font=dict(size=11, color="rgba(110,110,110,0.95)"))
+        edges = [left, right]
+        fig.update_xaxes(range=[edges[0], edges[-1]])
     if actual_key and actual_key in set(plot_df["jkey"]):
         r = plot_df[plot_df["jkey"] == actual_key].iloc[0]
         fig.add_annotation(x=np.log10(r[x_col]) if ss.log_x else r[x_col], y=r[y_col],
                            text="★ actually published here", showarrow=True, arrowhead=2, ax=60,
                            ay=-40, font=dict(size=12))
-    fig.update_layout(height=620, legend_title_text="", margin=dict(t=30, r=10, b=10, l=10),
-                      legend=dict(orientation="h", y=1.04, x=0), clickmode="event+select")
+    fig.update_layout(height=640, legend_title_text="", margin=dict(t=60, r=10, b=10, l=10),
+                      legend=dict(orientation="h", y=1.09, x=0), clickmode="event+select")
     fig.update_xaxes(showgrid=True, gridcolor="rgba(128,128,128,0.15)")
     fig.update_yaxes(showgrid=True, gridcolor="rgba(128,128,128,0.15)", rangemode="tozero")
     event = st.plotly_chart(fig, width="stretch", on_select="rerun", selection_mode="points",
@@ -453,9 +504,12 @@ else:
     pts = (event or {}).get("selection", {}).get("points", []) if event else []
     if pts and pts[0].get("customdata"):
         selected_key = pts[0]["customdata"][0]
+    band_note = (f" Shaded bands = thirds of all journals in this result set by {x_col.lower()} (low < {cuts[0]:.2f} ≤ "
+                 f"mid < {cuts[1]:.2f} ≤ high) — relative to this result set, not a global ranking."
+                 if ss.bands and cuts else "")
     st.caption(f"Top-right = high {Y_LABELS[y_col].split(' (')[0].lower()} and high impact. Bubble "
                f"size = {ss.size_metric.lower()} (log-scaled). **Click a bubble** for journal details "
-               "and links.")
+               f"and links.{band_note}")
 
 # ------------------------------------------------------------------ journal detail card
 journal_names = j["Journal"].tolist()
@@ -476,14 +530,22 @@ if pick != "—":
                  f"Main subfield: {r['Main subfield']}" if isinstance(r["Main subfield"], str) else "",
                  "Open-access journal" if r["Open access journal"] == True else "",  # noqa: E712
                  "In DOAJ" if r["In DOAJ"] == True else "",  # noqa: E712
-                 f"APC: ${r['APC (USD)']:,.0f}" if pd.notna(r["APC (USD)"]) else ""]
+                 f"APC: ${r['APC (USD)']:,.0f}" if pd.notna(r["APC (USD)"]) else "",
+                 f"{r['Impact band']} impact (within these results)" if r.get("Impact band") else ""]
         st.caption(" · ".join(f for f in facts if f))
+        nih = r.get("NIH / PMC", "Unknown")
+        nih_text = core.NIH_STATUS_HELP.get(nih, "PMC Journal List couldn't be checked.")
+        icon = "✅" if str(nih).startswith("Immediate") else ("⏳" if nih == "Delayed" else "ℹ️")
+        st.markdown(f"{icon} **NIH public access: {nih}**"
+                    + (f" ({r['PMC delay']})" if r.get("PMC delay") else "") + f" — {nih_text}")
         links = []
         if isinstance(r["Homepage"], str) and r["Homepage"]:
             links.append(f"[Journal homepage]({r['Homepage']})")
         links.append(f"[NLM Catalog]({r['NLM Catalog']})")
         q = (r["Journal"] + " author guidelines").replace(" ", "+")
         links.append(f"[Find author guidelines](https://duckduckgo.com/?q={q})")
+        if r.get("PMC URL"):
+            links.append(f"[PMC Journal List entry]({r['PMC URL']})")
         if isinstance(r["openalex_id"], str):
             links.append(f"[OpenAlex]({r['openalex_id']})")
         links.append("[Its similar papers](https://pubmed.ncbi.nlm.nih.gov/?term="
@@ -504,12 +566,22 @@ if ss.demo:
 # ------------------------------------------------------------------ table
 st.subheader("Ranked journals")
 cols = ["Journal", "Group", "Balanced", "Fit", "Appetite %", "Your-type papers", "Total papers",
-        "Similar articles", "2-yr mean citedness", "h-index", "Articles/yr", "Main subfield",
-        "Open access journal", "In DOAJ", "APC (USD)", "Publisher", "Homepage", "NLM Catalog"]
+        "Similar articles", "2-yr mean citedness", "Impact band", "h-index", "Articles/yr",
+        "NIH / PMC", "PMC delay", "Main subfield", "Open access journal", "In DOAJ", "APC (USD)",
+        "Publisher", "Homepage", "NLM Catalog"]
 app_cols = {"Balanced", "Appetite %", "Your-type papers", "Total papers"}
 cols = [c for c in cols if c in j and (c not in app_cols or has_app)]
-st.dataframe(j[cols], hide_index=True, width="stretch",
+table = j[cols].reset_index(drop=True)
+styled = table.style.map(
+    lambda v: f"background-color: {BAND_CELLS[v]}; color: #1f2933" if v in BAND_CELLS else "",
+    subset=["Impact band"]).format(precision=2, subset=[c for c in ["2-yr mean citedness"] if c in table])
+st.dataframe(styled, hide_index=True, width="stretch",
              column_config={
+                 "NIH / PMC": st.column_config.TextColumn(
+                     help="From the PMC Journal List. 'Immediate' = deposits in PMC on publication "
+                          "(meets the 2024 NIH policy automatically)."),
+                 "Impact band": st.column_config.TextColumn(
+                     help="Thirds of the journals in this result set by the x-axis impact metric."),
                  "Fit": st.column_config.ProgressColumn("Fit", min_value=0, max_value=100, format="%.0f"),
                  "Balanced": st.column_config.ProgressColumn("Balanced", min_value=0, max_value=100,
                                                              format="%.0f"),
@@ -519,6 +591,10 @@ st.dataframe(j[cols], hide_index=True, width="stretch",
                  "Articles/yr": st.column_config.NumberColumn(format="%.0f"),
                  "Homepage": st.column_config.LinkColumn(display_text="homepage"),
                  "NLM Catalog": st.column_config.LinkColumn(display_text="catalog")})
+st.caption("NIH / PMC: ✅ *Immediate* journals deposit in PubMed Central on publication — "
+           "NIH-compliant with no action from you. Others may still be compliant if you deposit your "
+           "accepted manuscript via NIHMS and the publisher allows zero embargo; check before "
+           "submitting. Source: PMC Journal List (updated daily).")
 st.download_button("Download CSV", j.drop(columns=["issns", "pmids"]).to_csv(index=False),
                    "journal_fit.csv", "text/csv")
 
