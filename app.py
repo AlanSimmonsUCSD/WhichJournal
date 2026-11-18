@@ -17,6 +17,13 @@ import textextract
 
 st.set_page_config(page_title="Journal Finder", page_icon="📚", layout="wide")
 
+CORE_VERSION = "1.5"
+if getattr(core, "VERSION", None) != CORE_VERSION:
+    st.error(f"`core.py` is out of date (found version {getattr(core, 'VERSION', 'unknown')}, "
+             f"expected {CORE_VERSION}). Upload **all** project files to GitHub — app.py, core.py, "
+             "textextract.py, requirements.txt, packages.txt — then reboot the app. Some features "
+             "are disabled until then.")
+
 # OpenAlex subfield names that count as "in your domain" (used for colouring only)
 DOMAIN_SUBFIELDS = {
     "Cardiology": {"Cardiology and Cardiovascular Medicine"},
@@ -298,6 +305,10 @@ st.title("📚 Journal Finder")
 st.caption("Paste or upload your manuscript's title and abstract. Journals are ranked by how "
            "similar their recent papers are to yours (**fit**) and plotted against **impact**. "
            "Data: PubMed (NCBI) + OpenAlex.")
+st.caption("ℹ️ If there are too many requests (impact data missing, or an OpenAlex limit message), "
+           "you may need to enter a personal OpenAlex API key — free at "
+           "[openalex.org](https://help.openalex.org/api/authentication/) — in **Advanced** on the "
+           "sidebar.")
 
 if ss.get("link_error"):
     st.warning(ss.pop("link_error"))
@@ -368,6 +379,13 @@ if not res:
 
 # ------------------------------------------------------------------ results
 j = res["journals"].copy()
+# tolerate results produced by an older core.py (or an older cached result)
+for col, default in {"NIH / PMC": "Unknown", "PMC delay": "", "PMC URL": "", "Main subfield": None,
+                     "Open access journal": None, "In DOAJ": None, "APC (USD)": np.nan,
+                     "Publisher": None, "Homepage": None, "openalex_id": None,
+                     "2-yr mean citedness": np.nan, "h-index": np.nan, "Articles/yr": np.nan}.items():
+    if col not in j:
+        j[col] = default
 if j.empty:
     st.warning("No PubMed hits for this combination of filters. Loosen a filter (domain, type, years).")
     with st.expander("PubMed query"):
@@ -463,6 +481,7 @@ else:
              "NIH / PMC": True, "Impact band": True}
     if has_app:
         hover.update({"Balanced": ":.0f", "Appetite %": ":.1f"})
+    hover = {k: v for k, v in hover.items() if k in plot_df.columns}  # never ask for a missing column
     fig = px.scatter(
         plot_df, x=x_col, y=y_col, size="_size", size_max=38, color="Group", symbol="Group",
         color_discrete_map=GROUP_COLORS, symbol_map=GROUP_SYMBOLS, text="label", log_x=ss.log_x,
@@ -534,7 +553,7 @@ if pick != "—":
                  f"{r['Impact band']} impact (within these results)" if r.get("Impact band") else ""]
         st.caption(" · ".join(f for f in facts if f))
         nih = r.get("NIH / PMC", "Unknown")
-        nih_text = core.NIH_STATUS_HELP.get(nih, "PMC Journal List couldn't be checked.")
+        nih_text = getattr(core, "NIH_STATUS_HELP", {}).get(nih, "PMC Journal List couldn't be checked.")
         icon = "✅" if str(nih).startswith("Immediate") else ("⏳" if nih == "Delayed" else "ℹ️")
         st.markdown(f"{icon} **NIH public access: {nih}**"
                     + (f" ({r['PMC delay']})" if r.get("PMC delay") else "") + f" — {nih_text}")

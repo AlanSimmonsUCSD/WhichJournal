@@ -25,6 +25,8 @@ import requests
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
+VERSION = "1.5"  # app.py checks this, to catch a stale core.py after a partial upload
+
 EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 OPENALEX = "https://api.openalex.org"
 
