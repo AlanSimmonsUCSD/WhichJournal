@@ -591,9 +591,15 @@ cols = ["Journal", "Group", "Balanced", "Fit", "Appetite %", "Your-type papers",
 app_cols = {"Balanced", "Appetite %", "Your-type papers", "Total papers"}
 cols = [c for c in cols if c in j and (c not in app_cols or has_app)]
 table = j[cols].reset_index(drop=True)
-styled = table.style.map(
-    lambda v: f"background-color: {BAND_CELLS[v]}; color: #1f2933" if v in BAND_CELLS else "",
-    subset=["Impact band"]).format(precision=2, subset=[c for c in ["2-yr mean citedness"] if c in table])
+# A pandas Styler overrides Streamlit's column formats, so format every number column here.
+NUM_FORMATS = {"Fit": "{:.0f}", "Balanced": "{:.0f}", "Appetite %": "{:.1f}%",
+               "Your-type papers": "{:,.0f}", "Total papers": "{:,.0f}", "Similar articles": "{:.0f}",
+               "2-yr mean citedness": "{:.2f}", "h-index": "{:.0f}", "Articles/yr": "{:,.0f}",
+               "APC (USD)": "${:,.0f}"}
+styled = (table.style
+          .map(lambda v: f"background-color: {BAND_CELLS[v]}; color: #1f2933" if v in BAND_CELLS else "",
+               subset=["Impact band"])
+          .format({c: f for c, f in NUM_FORMATS.items() if c in table}, na_rep=""))
 st.dataframe(styled, hide_index=True, width="stretch",
              column_config={
                  "NIH / PMC": st.column_config.TextColumn(
