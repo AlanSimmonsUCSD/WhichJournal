@@ -671,3 +671,6 @@ with st.expander("🔎 PubMed query actually used"):
     if res.get("keywords"):
         st.write("Refined keywords:", ", ".join(res["keywords"]))
     st.code(res["query"], language="text")
+
+st.caption("ℹ️ if you want to read my thoughts checkout my rambling post"
+           "[boots and the brain](https://bootsandthebrain.substack.com/)")
