@@ -1,4 +1,6 @@
-# 📚 Journal Finder
+# 📚 Title & Abstract Recommendations: Zeitgeist, Authorship, & Notoriety
+
+*Navigate the jungle of academic publishing.*
 
 A JANE-style ([jane.biosemantics.org](https://jane.biosemantics.org/)) journal recommender with a
 **fit × impact** scatter plot. Paste your title and abstract. The app finds the most similar recent
@@ -29,6 +31,30 @@ papers match yours. Each journal is plotted with:
 - **🧑‍🔬 Suggested reviewers**: authors of the most similar papers, weighted by similarity. First and
   last authors count fully, middle authors half. Includes their latest affiliation and PubMed links,
   plus a box to exclude yourself and your co-authors. Always check for conflicts of interest.
+- **👤 Your author profile → reviewers' citations of your work.** Enter your name(s) or ORCID(s)
+  (several, separated by `;`). By default the names are only used to drop matching names from the
+  reviewer list, with no lookups. The **citation check is opt-in**. Switching it on shows a note on
+  API usage (it draws on the app's shared OpenAlex key unless you enter your own) and a caution
+  note: suggested reviewers must be independent experts, citing you is not the same as being
+  impartial, and conflicts must be disclosed. Names are then matched to OpenAlex author profiles
+  (you pick the right person from a list), and **Check citations of my work** adds these columns to
+  the reviewer table:
+  - **Cites you (papers)**: the reviewer's papers that cite any of your works. Exact and deduplicated.
+  - **Cite rate %**: the same count as a percentage of all the reviewer's papers.
+  - **Co-authored (papers)** and **Last co-authored**: a conflict-of-interest flag.
+  - **Composite**: a weighted geometric mean of reviewer fit and citation rate, with a slider. The
+    citation rate is floored at 0.05, so reviewers who have never cited you are penalised but not
+    removed.
+
+  **Uploading a manuscript fills this in automatically**: the names between the title and the
+  abstract are read (degrees and affiliation markers removed). Check them, and pick the right
+  person for each name.
+
+  By default, the entered authors are excluded from the reviewer list, and so are co-authors from
+  the last 5 years (switch either off). You can sort by composite score, citations, citation rate or
+  fit. Reviewers are matched to OpenAlex through the PubMed papers that made them a suggestion. A
+  few may stay unmatched and show blanks. Uses about 10 OpenAlex requests per check, so a personal
+  API key is recommended.
 - **🔗 Shareable links**: a URL that restores all the filters, and optionally the abstract
   (compressed), which re-runs the search when opened. Leave the abstract out for unpublished work.
 - **NIH public access status** for each journal, plus a filter (see below).
@@ -167,6 +193,7 @@ editorial policy: many journals only publish reviews by invitation, so check the
 Code layout:
 - `core.py`: search, scoring, appetite and reviewers. It has no UI code, so you can use it from a notebook.
 - `textextract.py`: reads PDF / DOCX / DOC files.
+- `authors.py`: author lookup, reviewer citations and co-authorship (OpenAlex).
 - `app.py`: the Streamlit UI.
 - `packages.txt`: system packages for Streamlit Cloud (`antiword`, for old .doc files).
   To read .doc files locally, run `brew install antiword` or `apt install antiword`, or just save
@@ -183,6 +210,15 @@ To get a free public web app, go to [share.streamlit.io](https://share.streamlit
 **New app**, pick the repo and set `app.py` as the main file. Paste `CONTACT_EMAIL` /
 `OPENALEX_API_KEY` / `NCBI_API_KEY` under *Settings → Secrets*. **Never commit `.streamlit/secrets.toml`**; it is
 already in `.gitignore`.
+
+## API keys and privacy
+
+Keys in Streamlit **Secrets** stay on the server. Visitors can't see them in GitHub, in the page, or
+in the app's traffic: the Advanced sidebar boxes always start empty, and an empty box means "use the
+app's key on the server". But every visitor's requests **do use your key's allowance**. A visitor
+can enter their own OpenAlex key in Advanced, which is used only for their session and never stored.
+If your shared allowance runs out, OpenAlex-dependent data (impact, citation checks) is unavailable
+until midnight UTC, and the app says so. Fit rankings keep working.
 
 ## Data & licensing notes
 

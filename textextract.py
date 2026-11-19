@@ -72,3 +72,61 @@ def find_title_abstract(text: str, max_abstract_chars: int = 4000) -> tuple[str,
         start = text.find(title) + len(title) if title else 0
         abstract = text[start: start + 2500]
     return _clean(title), _clean(abstract)[:max_abstract_chars]
+
+
+# ---------------------------------------------------------------------------------------------
+# Authors: the lines between the title and the abstract
+# ---------------------------------------------------------------------------------------------
+_DEGREES = {"md", "phd", "msc", "ms", "mph", "bsc", "ba", "bs", "ma", "mba", "rn", "dphil", "mbbs",
+            "frcp", "frcpc", "facp", "do", "pharmd", "psyd", "scd", "drph", "mbchb", "frcpsych",
+            "prof", "dr", "jr", "sr", "ii", "iii", "mrcpsych", "dsc", "bm", "bch", "mrcp", "faha"}
+_NOT_NAMES = re.compile(
+    r"(department|dept\.?|university|universit|institute|college|hospital|school|faculty|centre|"
+    r"center|clinic|laboratory|division|unit\b|foundation|corresponding|correspondence|e-?mail|@|"
+    r"address|tel\.?|phone|fax|street|road|avenue|usa|united|kingdom|running|word count|keywords|"
+    r"orcid|equal contribution|contributed equally|received|accepted|abstract|summary)", re.I)
+
+
+def _clean_name(raw: str) -> str:
+    s = re.sub(r"[\d\*†‡§¶#∗,]+$", "", raw.strip())           # trailing affiliation markers
+    s = re.sub(r"(?<=[A-Za-z\.])[\d\*†‡§¶#∗]+", "", s)          # markers glued to the name
+    s = re.sub(r"\s*\(.*?\)\s*", " ", s)                        # (ORCID ...) etc.
+    toks = s.replace(",", " ").split()
+    # "Carpenter JR" (PubMed style: surname + initials) — don't mistake initials for degrees/suffixes
+    if len(toks) == 2 and re.fullmatch(r"[A-Z]{1,3}", toks[1]) and len(toks[0]) > 1:
+        return " ".join(toks)
+    toks = [t for t in toks if t.strip(".").lower() not in _DEGREES]
+    return " ".join(toks).strip(" .;:-")
+
+
+def _looks_like_name(s: str) -> bool:
+    toks = s.split()
+    if not 2 <= len(toks) <= 5 or _NOT_NAMES.search(s) or any(ch.isdigit() for ch in s):
+        return False
+    # every token is Capitalised, an initial ("J." / "JR"), or a particle (van, de, ...)
+    particles = {"van", "von", "de", "der", "den", "da", "di", "du", "del", "la", "le", "ter", "bin", "al"}
+    return all(t[0].isupper() or t.lower() in particles or t.startswith(("d'", "O'")) for t in toks)
+
+
+def find_authors(text: str, title: str = "", max_authors: int = 30) -> list[str]:
+    """Author names from the block between the title and the abstract (heuristic)."""
+    head = text
+    if title and title[:40] in text:
+        head = text[text.index(title[:40]) + len(title[:40]):]
+        head = head[head.find("\n") + 1:] if "\n" in head else head
+    m = _ABSTRACT_HEAD.search(head)
+    head = head[: m.start()] if m else head[:1500]
+    names: list[str] = []
+    for line in head.splitlines():
+        line = line.strip()
+        if not line or _NOT_NAMES.search(line) and not re.search(r",.*,", line):
+            continue
+        if re.match(r"^\s*[\d\*†‡§¶a-z]\s", line):  # "1 Department of ..." affiliation lines
+            continue
+        # split on commas / semicolons / " and " / "&", but keep "Smith, MD" together by
+        # cleaning degrees after splitting
+        for part in re.split(r"\s*(?:;|,|\band\b|&)\s*", line):
+            nm = _clean_name(part)
+            if _looks_like_name(nm) and nm not in names:
+                names.append(nm)
+    return names[:max_authors]

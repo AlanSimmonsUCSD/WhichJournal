@@ -1,5 +1,5 @@
 """
-Journal Finder — Streamlit UI.   Run:  streamlit run app.py
+Title & Abstract Recommendations: Zeitgeist, Authorship, & Notoriety — Streamlit UI.   Run:  streamlit run app.py
 """
 import base64
 import datetime as dt
@@ -12,12 +12,13 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+import authors
 import core
 import textextract
 
-st.set_page_config(page_title="Journal Finder", page_icon="📚", layout="wide")
+st.set_page_config(page_title="Title & Abstract Recommendations: Zeitgeist, Authorship, & Notoriety", page_icon="📚", layout="wide")
 
-CORE_VERSION = "1.6"
+CORE_VERSION = "1.7"
 if getattr(core, "VERSION", None) != CORE_VERSION:
     st.error(f"`core.py` is out of date (found version {getattr(core, 'VERSION', 'unknown')}, "
              f"expected {CORE_VERSION}). Upload **all** project files to GitHub — app.py, core.py, "
@@ -178,6 +179,8 @@ def mark_custom():
 
 def clear_all():
     ss.abstract, ss.demo, ss.result, ss.exclude_pmid = "", None, None, ""
+    ss.me_saved = ss.me_text = ""
+    ss.pop("cite", None)
     st.query_params.clear()
 
 
@@ -218,8 +221,17 @@ def load_upload():
         return
     ss.abstract = f"{title}\n\n{abstract}" if title else abstract
     ss.demo, ss.exclude_pmid, ss.result = None, "", None
+    try:
+        names = textextract.find_authors(text, title)
+    except Exception:
+        names = []
+    if names:  # pre-fill the author profile (reviewer exclusion + citation check)
+        ss.me_saved = ss.me_text = "; ".join(names)
+        ss.pop("cite", None)
+    who = (f" Found {len(names)} author(s) — added to **Your author profile** below the results, "
+           "so they're excluded from suggested reviewers." if names else "")
     ss.notice = ("info", f"Loaded title and abstract from **{f.name}** — check the text below "
-                         "(extraction is heuristic) and edit if needed. The file is not stored.")
+                         f"(extraction is heuristic) and edit if needed.{who} The file is not stored.")
 
 
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
@@ -294,14 +306,26 @@ with st.sidebar:
         n_cand = st.slider("PubMed candidates per pass", 100, 1000, 300, step=100)
         top_k = st.slider("Top-K most similar articles used for scoring", 20, 200, 50, step=10)
         refine = st.toggle("Two-pass keyword refinement", True)
-        email = st.text_input("Your e-mail (polite API use)", secret("CONTACT_EMAIL"))
-        ncbi_key = st.text_input("NCBI API key", secret("NCBI_API_KEY"), type="password")
-        oa_key = st.text_input("OpenAlex API key", secret("OPENALEX_API_KEY"), type="password",
-                               help="Free at openalex.org. Without one, impact data uses a small "
-                                    "daily allowance shared by everyone on the same IP address.")
+        # Secrets are NEVER put into widgets: a widget's value is sent to the visitor's browser
+        # (and a password box can be revealed). Empty box = use the app owner's secret server-side.
+        has_oa, has_ncbi = bool(secret("OPENALEX_API_KEY")), bool(secret("NCBI_API_KEY"))
+        email_in = st.text_input("Your e-mail (optional, polite API use)", "",
+                                 placeholder="optional")
+        ncbi_in = st.text_input("Your NCBI API key (optional)", "", type="password",
+                                placeholder="using the app's key" if has_ncbi else "optional")
+        oa_in = st.text_input("Your OpenAlex API key (optional)", "", type="password",
+                              placeholder="using the app's shared key" if has_oa else "recommended",
+                              help="Free at openalex.org. Leave empty to use the app's shared key "
+                                   "(its daily allowance is shared by all visitors). Your own key "
+                                   "is used only for your session and never stored.")
+        email = email_in.strip() or secret("CONTACT_EMAIL")
+        ncbi_key = ncbi_in.strip() or secret("NCBI_API_KEY")
+        oa_key = oa_in.strip() or secret("OPENALEX_API_KEY")
+        using_own_oa = bool(oa_in.strip())
 
 # ------------------------------------------------------------------ main: input
-st.title("📚 Journal Finder")
+st.title("📚 Title & Abstract Recommendations: Zeitgeist, Authorship, & Notoriety")
+st.subheader("Navigate the jungle of academic publishing")
 st.caption("Paste or upload your manuscript's title and abstract. Journals are ranked by how "
            "similar their recent papers are to yours (**fit**) and plotted against **impact**. "
            "Data: PubMed (NCBI) + OpenAlex.")
@@ -624,26 +648,184 @@ st.download_button("Download CSV", j.drop(columns=["issns", "pmids"]).to_csv(ind
                    "journal_fit.csv", "text/csv")
 
 # ------------------------------------------------------------------ pull-downs
-with st.expander("🧑‍🔬 Suggested reviewers"):
-    rv = res.get("reviewers", pd.DataFrame())
-    if rv is None or rv.empty:
+# ------------------------------------------------------------------ your authors + reviewers
+rv_all = res.get("reviewers", pd.DataFrame())
+if rv_all is None:
+    rv_all = pd.DataFrame()
+for c_ in ("last", "initials", "pmids"):  # results cached by an older core.py
+    if not rv_all.empty and c_ not in rv_all:
+        rv_all[c_] = [[] if c_ == "pmids" else "" for _ in range(len(rv_all))]
+
+
+@st.cache_data(ttl=7 * 24 * 3600, show_spinner=False)
+def resolve_entry(keys, kind, value):
+    client = core.Client(*keys)
+    if kind == "orcid":
+        a = authors.resolve_orcid(client, value)
+        return [a] if a else []
+    return authors.name_candidates(client, value)
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def run_citation_check(keys, my_ids, rv_key, rv_records):
+    client = core.Client(*keys)
+    rv = pd.DataFrame(rv_records)
+    return authors.citation_check(client, list(my_ids), rv, THIS_YEAR)
+
+
+with st.expander("👤 Your author profile — exclude yourself, optionally check reviewers' citations",
+                 expanded=bool(ss.get("me_text") or ss.get("me_saved"))):
+    st.caption("Enter yourself (and co-authors, if you like): PubMed-style names "
+               "(e.g. *Carpenter JR*) or ORCIDs, separated by semicolons. By default these names are "
+               "just removed from the suggested reviewers. Nothing is stored or put in share links.")
+    if "me_text" not in ss:  # widget state is dropped while the widget isn't shown; restore it
+        ss.me_text = ss.get("me_saved", "")
+    me_text = st.text_input("Author name(s) or ORCID(s)", key="me_text",
+                            placeholder="Carpenter JR; 0000-0002-1825-0097",
+                            on_change=lambda: ss.__setitem__("me_saved", ss.me_text))
+    keys_ = (email, ncbi_key, oa_key)
+    cite_on = st.toggle("Enable reviewer citation check (opt-in, uses OpenAlex)", False, key="cite_on",
+                        help="Off: the names above are only used to drop matching names from the "
+                             "reviewer list — no lookups. On: names are matched to OpenAlex profiles "
+                             "and you can count how often each reviewer has cited your work.")
+    my_ids, my_names = [], []
+    entries = authors.parse_entries(me_text)
+    if not cite_on:
+        # plain-name exclusion only (ORCIDs can't be excluded without a lookup)
+        my_names = [e["value"] for e in entries if e["kind"] == "name"]
+        if any(e["kind"] == "orcid" for e in entries):
+            st.caption("ORCIDs need the citation check (opt-in) to be resolved to names.")
+    else:
+        st.warning(
+            "**API usage.** Matching names and checking citations take roughly 10–20 OpenAlex "
+            "requests per check"
+            + (" and count against **your own** key." if using_own_oa else
+               " and draw on the app's **shared** OpenAlex allowance, used by every visitor. If you "
+               "plan to run several checks, please enter your own free key in **Advanced** "
+               "(sidebar)."))
+        st.info(
+            "**Use with care.** Having cited your work means a reviewer knows it — not that they "
+            "will be favourable, or impartial. Journals expect suggested reviewers to be independent "
+            "experts: don't use this to stack the panel with people likely to agree with you, and "
+            "always disclose conflicts (co-authors, same institution, mentors, close collaborators). "
+            "Editors may ignore suggestions, and many check them. OpenAlex author matching is "
+            "imperfect — verify any name before acting on it.")
+        for n_, e in enumerate(entries):
+            try:
+                cands = resolve_entry(keys_, e["kind"], e["value"])
+            except Exception as ex:
+                st.warning(f"Couldn't look up “{e['raw']}”: {ex}")
+                continue
+            if not cands:
+                st.warning(f"No OpenAlex author found for “{e['raw']}”.")
+                continue
+            if e["kind"] == "orcid":
+                pick = cands[0]
+                st.markdown(f"✓ **{pick['name']}** — {pick['institution'] or 'no institution listed'}, "
+                            f"{pick['works']:,} works (ORCID {e['value']})")
+            else:
+                labels = [f"{c['name']} — {c['institution'] or 'no institution'} · {c['works']:,} works"
+                          + (f" · ORCID {c['orcid']}" if c["orcid"] else "") for c in cands]
+                i_ = st.selectbox(f"Which “{e['raw']}”?", range(len(cands)),
+                                  format_func=lambda i: labels[i], key=f"me_pick_{n_}_{e['value']}",
+                                  help="OpenAlex may split one person into several profiles; an "
+                                       "ORCID is the most reliable way to identify someone.")
+                pick = cands[i_]
+            my_ids.append(pick["id"])
+            my_names.append(pick["name"])
+        if not using_own_oa and not secret("OPENALEX_API_KEY"):
+            st.caption("No OpenAlex key is configured, so lookups may fail once the free shared "
+                       "allowance is used up.")
+
+    cA, cB = st.columns(2)
+    excl_me = cA.toggle("Exclude these authors from reviewers", True, key="excl_me")
+    hide_co = cB.toggle("Hide co-authors from the last 5 years", True, key="hide_co",
+                        disabled=not cite_on,
+                        help="Journals generally don't accept recent co-authors as reviewers. "
+                             "Needs the citation check (opt-in).") and cite_on
+    cite_w = 0.5
+    if cite_on:
+        cite_w = st.slider("Composite score: reviewer fit ← → citation rate", 0.0, 1.0, 0.5, 0.1,
+                           key="cite_w", help="0 = fit only, 1 = citation rate only. Weighted "
+                                              "geometric mean, like the journal balanced score.")
+        can_check = bool(my_ids) and not rv_all.empty
+        if st.button("Check citations of my work", disabled=not can_check,
+                     help="Uses ~10 OpenAlex requests — a personal OpenAlex API key is recommended."):
+            rv_records = rv_all[["Name", "last", "initials", "pmids"]].to_dict("records")
+            rv_key = tuple(rv_all["Name"])
+            with st.spinner("Looking up your works and the reviewers' citations in OpenAlex…"):
+                try:
+                    ss.cite = {"ids": tuple(my_ids), "rv_key": rv_key,
+                               "df": run_citation_check(keys_, tuple(my_ids), rv_key, rv_records)}
+                except core.OpenAlexLimit as ex:
+                    st.error(f"{ex} Add a personal OpenAlex API key in Advanced (sidebar).")
+                except Exception as ex:
+                    st.error(f"Citation check failed: {ex}")
+
+with st.expander("🧑‍🔬 Suggested reviewers", expanded=bool(ss.get("cite"))):
+    if rv_all.empty:
         st.write("No author data available.")
     else:
-        excl = st.text_input("Exclude names (you, co-authors, collaborators) — comma-separated "
-                             "last names", "")
+        rv = rv_all.copy()
+        cite = ss.get("cite")
+        has_cite = (cite_on and bool(cite) and cite["rv_key"] == tuple(rv_all["Name"])
+                    and cite["ids"] == tuple(my_ids))
+        if has_cite:
+            rv = rv.join(cite["df"])
+            rv["Composite"] = authors.composite(rv["Score"], rv["Cite rate %"], cite_w)
+            st.caption(f"Checked against {cite['df'].attrs.get('n_my_works', 0):,} of your works; "
+                       f"{cite['df'].attrs.get('n_resolved', 0)} of {len(rv)} reviewers matched to an "
+                       "OpenAlex profile (unmatched ones show blank).")
+        elif cite and cite_on:
+            st.caption("Author list or results changed — press **Check citations of my work** again.")
+        # exclusions
+        n_before = len(rv)
+        if excl_me and my_names:
+            def _key(n):
+                t = authors._norm(n).split()
+                return (t[-1], t[0][:1]) if t else ("", "")
+            mine_k = {_key(n) for n in my_names}
+            rv = rv[~rv["Name"].map(_key).isin(mine_k)]
+            if has_cite:
+                rv = rv[~rv["Is you"].fillna(False)]
+        if hide_co and has_cite:
+            rv = rv[~rv["Recent co-author"].fillna(False)]
+        excl = st.text_input("Also exclude (comma-separated last names)", "", key="excl_more")
         if excl.strip():
             bad = {x.strip().lower() for x in excl.split(",") if x.strip()}
             rv = rv[~rv["Name"].str.lower().str.split().str[-1].isin(bad)]
-        st.caption("Authors of the papers most similar to yours, weighted by similarity "
-                   "(first/last authors count fully, middle authors half). Check for conflicts of "
-                   "interest — recent co-authors, same institution — before suggesting anyone.")
-        st.dataframe(rv, hide_index=True, width="stretch",
+        if len(rv) < n_before:
+            st.caption(f"{n_before - len(rv)} reviewer(s) hidden by your exclusions.")
+
+        sort_opts = ["Score"] + (["Composite", "Cites you (papers)", "Cite rate %"] if has_cite else [])
+        sort_by = st.selectbox("Sort by", sort_opts, index=1 if has_cite else 0,
+                               key=f"rv_sort_{has_cite}")  # new key -> defaults to Composite after a check
+        rv = rv.sort_values(sort_by, ascending=False, na_position="last")
+
+        show = ["Name", "Composite", "Score", "Cites you (papers)", "Cite rate %",
+                "Co-authored (papers)", "Last co-authored", "Similar papers", "first/last",
+                "Latest affiliation", "PubMed", "Their similar papers"]
+        show = [c_ for c_ in show if c_ in rv]
+        if "Last co-authored" in rv:
+            rv["Last co-authored"] = pd.to_numeric(rv["Last co-authored"], errors="coerce").map(
+                lambda y: "" if pd.isna(y) else str(int(y)))
+        st.caption("Score = how similar their papers are to yours (first/last authors count fully, "
+                   "middle authors half). Cites you = their papers citing any of your works; cite "
+                   "rate = that as % of all their papers. Check for conflicts of interest — "
+                   "co-authors, same institution — before suggesting anyone.")
+        st.dataframe(rv[show], hide_index=True, width="stretch",
                      column_config={
                          "Score": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.0f"),
+                         "Composite": st.column_config.ProgressColumn(min_value=0, max_value=100,
+                                                                      format="%.0f"),
+                         "Cites you (papers)": st.column_config.NumberColumn(format="%d"),
+                         "Cite rate %": st.column_config.NumberColumn(format="%.1f%%"),
+                         "Co-authored (papers)": st.column_config.NumberColumn(format="%d"),
                          "first/last": st.column_config.NumberColumn("First/last-author papers"),
                          "PubMed": st.column_config.LinkColumn("All their papers", display_text="PubMed"),
                          "Their similar papers": st.column_config.LinkColumn(display_text="view")})
-        st.download_button("Download reviewers CSV", rv.to_csv(index=False), "reviewers.csv", "text/csv")
+        st.download_button("Download reviewers CSV", rv[show].to_csv(index=False), "reviewers.csv",
+                           "text/csv")
 
 with st.expander("📄 Most similar articles (why each journal scored)"):
     a = res["articles"].head(top_k)[["similarity", "journal", "year", "title", "pmid"]].copy()

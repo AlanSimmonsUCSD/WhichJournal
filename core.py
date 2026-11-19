@@ -25,7 +25,7 @@ import requests
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-VERSION = "1.6"  # app.py checks this, to catch a stale core.py after a partial upload
+VERSION = "1.7"  # app.py checks this, to catch a stale core.py after a partial upload
 
 EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 OPENALEX = "https://api.openalex.org"
@@ -408,10 +408,11 @@ def suggest_reviewers(articles: pd.DataFrame, top_k: int = 50, n: int = 30) -> p
                     + "+" + df["initials"] + "%5Bau%5D")
     df["Their similar papers"] = df["papers"].apply(
         lambda ps: "https://pubmed.ncbi.nlm.nih.gov/?term=" + "+OR+".join(f"{p}%5Bpmid%5D" for p in ps))
-    df = df.rename(columns={"affiliation": "Latest affiliation"})
+    df = df.rename(columns={"affiliation": "Latest affiliation", "papers": "pmids"})
+    # last / initials / pmids are kept (hidden in the table) for the citation check
     return (df.sort_values(["Score", "Similar papers"], ascending=False).head(n)
               [["Name", "Score", "Similar papers", "first/last", "Latest affiliation", "PubMed",
-                "Their similar papers"]].reset_index(drop=True))
+                "Their similar papers", "last", "initials", "pmids"]].reset_index(drop=True))
 
 
 # --------------------------------------------------------------------------------------
