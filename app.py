@@ -16,7 +16,7 @@ import authors
 import core
 import textextract
 
-st.set_page_config(page_title="Title & Abstract Recommendations: Zeitgeist, Authorship, & Notoriety", page_icon="📚", layout="wide")
+st.set_page_config(page_title="Title & Abstract Recommendations: Zeitgeist, Authorship, & Notoriety (TARZAN)", page_icon="📚", layout="wide")
 
 CORE_VERSION = "1.7"
 if getattr(core, "VERSION", None) != CORE_VERSION:
